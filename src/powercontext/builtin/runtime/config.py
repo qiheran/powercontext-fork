@@ -199,6 +199,25 @@ class RuntimeConfig(BaseModel):
             raise ValueError(_RECALL_GATE_ROUND2_ORDER_ERROR)
         return self
 
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def require_strict_count_threshold(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("Source count threshold must be a strict positive integer or None")  # noqa: TRY003
+        return value
+
+    # Count admission: automatically accept one processing invocation once the
+    # number of persisted journal identities after the last successful cursor
+    # reaches the threshold. None keeps the pure time-driven behavior.
+    memory_source_count_threshold: int | None = None
+    topic_memory_source_count_threshold: int | None = None
+
     schedule_seconds: float | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
     experience_schedule_seconds: float | None = Field(default=None, gt=0)
