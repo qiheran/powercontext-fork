@@ -14,6 +14,7 @@
 
 """Embedded seekdb async relational profile."""
 
+from powercontext.builtin.persistence.seekdb.memory_index import SeekDBMemoryIndex
 from powercontext.builtin.persistence.seekdb.profile import (
     SeekDBConfig,
     SeekDBProfile,
@@ -22,6 +23,7 @@ from powercontext.builtin.persistence.seekdb.profile import (
 
 __all__ = (
     "SeekDBConfig",
+    "SeekDBMemoryIndex",
     "SeekDBProfile",
     "SeekDBUnavailableError",
 )
