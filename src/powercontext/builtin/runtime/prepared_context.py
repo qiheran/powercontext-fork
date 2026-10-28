@@ -460,7 +460,12 @@ class PreparedContextBuilder:
         memory_entries: list[_PreparedContextEntry] = []
         seen: set[tuple[str, str]] = set()
         for hit in hits:
-            if hit.memory_ref != memory_ref:
+            # Hits may be anchored at any historical Revision of the same Memory
+            # artifact (the Runtime stabilizes citations for incremental pack
+            # transport); only cross-artifact contamination is an invariant breach.
+            if memory_ref is not None and (
+                hit.memory_ref.family != memory_ref.family or hit.memory_ref.artifact_id != memory_ref.artifact_id
+            ):
                 raise PreparedContextInvariantError("memory-ref-mismatch")
 
             citation_key = (hit.entry_id, hit.entry_version_id)

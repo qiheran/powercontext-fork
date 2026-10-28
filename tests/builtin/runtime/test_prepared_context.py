@@ -452,13 +452,32 @@ def test_builder_skips_an_entry_that_cannot_fit_but_keeps_a_later_shorter_one() 
 
 def test_builder_rejects_a_hit_from_a_different_memory_head() -> None:
     other_ref = MEMORY_REF.model_copy(update={"revision": 4})
+    foreign_ref = ArtifactRef(family="memory", artifact_id="memory-elsewhere", revision=1)
 
     with pytest.raises(PreparedContextInvariantError, match="memory-ref-mismatch"):
         PreparedContextBuilder().build(
             memory_ref=MEMORY_REF,
-            hits=(_hit("other", "Other head", memory_ref=other_ref),),
+            hits=(_hit("foreign", "Foreign artifact", memory_ref=foreign_ref),),
             request=PrepareContextRequest(query="head"),
         )
+
+
+def test_builder_accepts_a_hit_anchored_at_a_historical_revision_of_the_same_memory() -> None:
+    historical_ref = MEMORY_REF.model_copy(update={"revision": 1})
+
+    prepared = PreparedContextBuilder().build(
+        memory_ref=MEMORY_REF,
+        hits=(_hit("stable", "Historically anchored", memory_ref=historical_ref),),
+        request=PrepareContextRequest(query="head"),
+    )
+
+    assert prepared.status == "ready"
+    item = _items(prepared.content)[0]
+    assert item["citation"]["memory_ref"] == {
+        "family": "memory",
+        "artifact_id": "memory",
+        "revision": 1,
+    }
 
 
 def test_builder_prepares_experience_without_a_memory_head_and_keeps_v1_envelope() -> None:
