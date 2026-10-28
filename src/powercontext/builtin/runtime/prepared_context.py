@@ -106,6 +106,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,21 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One verbatim fragment of a Memory entry selected for the current query.
+
+    ``start``/``end`` are half-open character coordinates into the exact
+    ``entry.text`` addressed by ``address`` and ``text`` is always
+    ``entry.text[start:end]``: fragments are literal evidence, never rewrites.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -234,6 +250,17 @@ class PreparedContextBuilder:
             raise PreparedContextInvariantError("topic-memory-candidate-limit")
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
+
+        if request.evidence_selection:
+            # Deferred import: the evidence selector imports this module's data
+            # classes, so the dependency is only resolved at call time.
+            from powercontext.builtin.runtime.prepared_evidence import build_evidence_result
+
+            return build_evidence_result(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
