@@ -195,14 +195,42 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 # ---------------------------------------------------------------------------
 
 _WORD_PATTERN = re.compile(r"[a-z]+|\d+")
-_FISCAL_YEAR_PATTERN = re.compile(r"\bf(?:y|iscal)\s*(\d{4})\b")
+
+_FISCAL_YEAR_PATTERN = re.compile(r"\bf(?:y|iscal)\s*(\d{2,4})\b")
 _AMORTIZATION_ACRONYM_PATTERN = re.compile(r"\bd\s*&\s*a\b")
+_MA_ACRONYM_PATTERN = re.compile(r"\bm\s*&\s*a\b")
 _INCOME_ACRONYM_PATTERN = re.compile(r"\bp\s*&\s*l\b")
 
+
+def _strip_plural(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("sses"):
+        return token[:-2]
+    if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+def _content_stems(tokens: list[str]) -> list[str]:
+    return [_stem(token) for token in tokens if token not in _STOPWORDS and (len(token) > 1 or token.isdigit())]
+
+
+def _bigram_key(first: str, second: str) -> tuple[str, str]:
+    return (first, second) if first <= second else (second, first)
+
+
+_HEADER_BOILERPLATE = frozenset(("table", "contents", "content", "page", "able", "10", "k"))
+
+
+
 _EXPANSION_WEIGHT = 0.5
-_BIGRAM_BONUS = 0.35
-_HEADER_WINDOW = 18
+_BIGRAM_BONUS = 2.0
+_HEADER_WINDOW = 40
 _HEADER_BONUS = 12.0
+_HEADER_CONCEPT_BONUS = 14.0
+_DOCUMENT_IDENTITY_BONUS = 14.0
+_STATEMENT_PAGE_BONUS = 12.0
+_COVERAGE_BONUS = 6.0
 _BM25_K1 = 1.5
 _BM25_B = 0.35
 
@@ -216,9 +244,53 @@ _STOPWORDS = frozenset((
     "also", "into", "only", "per", "via", "please", "about", "over", "under", "between",
     "within", "without", "whether", "there", "here", "other", "more", "most", "less", "least",
     "very", "just", "like", "same", "own",
+    "reasonably", "healthy", "improving", "improve", "improved", "dragged",
+    "subject", "based", "data", "compare", "comparing", "report", "reports",
+    "excluding", "exclusion", "include", "including", "given", "well",
 ))
 
-_FISCAL_YEAR_TOKEN = re.compile(r"^fy(\d{4})$")
+_FISCAL_YEAR_TOKEN = re.compile(r"^fy(\d{2,4})$")
+
+
+def _full_year(digits: str) -> str:
+    return digits if len(digits) == 4 else f"20{digits}"
+
+def _strip_suffixes(token: str) -> str:
+    if token.endswith("ation") and len(token) > 6:
+        token = token[:-2]
+    if token.endswith("ing") and len(token) > 5:
+        return token[:-3]
+    if token.endswith("ed") and len(token) > 4:
+        token = token[:-2]
+    if token.endswith("ity") and len(token) > 6:
+        token = token[:-3]
+    if token.endswith("e") and len(token) > 4:
+        return token[:-1]
+    return token
+
+
+def _stem(token: str) -> str:
+    if len(token) <= 3 or token.isdigit():
+        return token
+    return _strip_suffixes(_strip_plural(token))
+
+
+
+
+
+def _hdr(first: str, second: str) -> tuple[str, str]:
+    return _bigram_key(_stem(first), _stem(second))
+
+
+_PRIMARY_STATEMENT_BIGRAMS = frozenset((
+    _hdr("consolidated", "statements"),
+    _hdr("statement", "operations"),
+    _hdr("statement", "income"),
+    _hdr("balance", "sheets"),
+    _hdr("statements", "cash"),
+    _hdr("cash", "flows"),
+))
+
 
 _TOKEN_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "fy": ("fiscal",),
@@ -252,54 +324,103 @@ _TOKEN_EXPANSIONS: dict[str, tuple[str, ...]] = {
 
 _PHRASE_EXPANSIONS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
     (frozenset(("income", "statement")), ("consolidated",)),
-    (frozenset(("cash", "flow")), ("consolidated", "statement")),
-    (frozenset(("balance", "sheet")), ("consolidated", "statement")),
+    (frozenset(_hdr("cash", "flows")), _hdr("consolidated", "statements")),
+    (frozenset(_hdr("balance", "sheets")), _hdr("consolidated", "statements")),
     (frozenset(("operating", "income")), ("profit", "operations")),
+    (frozenset(("capital", "intensive")), (
+        "depreciation", "property", "plant", "equipment", "expenditures", "purchases",
+    )),
+    (frozenset(("days", "payable")), ("accounts", "payable", "inventory", "purchases")),
+    (frozenset(("customer", "concentration")), ("customers", "revenue", "significant")),
+    (frozenset(("effective", "tax")), ("income", "taxes", "rate")),
+    (frozenset(("gross", "margin")), ("cost", "sales", "profit")),
+    (frozenset(("working", "capital")), ("current", "assets", "liabilities", "cash")),
+)
+
+# Concept groups map finance questions to the vocabulary and statement headers
+# that typically carry the answer, since 10-K evidence concentrates on the
+# primary financial statements.
+_CONCEPT_GROUPS: tuple[tuple[frozenset[str], tuple[str, ...], tuple[tuple[str, str], ...]], ...] = (
+    (
+        frozenset(("liquidity", "liquid", "solvency", "balance")),
+        ("cash", "current", "assets", "liabilities", "investments", "debt"),
+        (_hdr("balance", "sheets"), _hdr("consolidated", "statements"), _hdr("statements", "cash")),
+    ),
+    (
+        frozenset(("capex", "capital", "expenditure", "expenditures")),
+        ("depreciation", "amortization", "property", "plant", "equipment", "purchases", "spending"),
+        (_hdr("cash", "flows"), _hdr("statements", "cash"), _hdr("consolidated", "statements"),
+         _hdr("statement", "income"), _hdr("statement", "operations"), _hdr("balance", "sheets")),
+    ),
+    (
+        frozenset(("revenue", "revenues", "sales")),
+        ("net", "sales", "products", "services", "cost"),
+        (_hdr("statement", "operations"), _hdr("consolidated", "statements"), _hdr("statement", "income")),
+    ),
+    (
+        frozenset(("cyclicality", "cyclical", "cycle")),
+        ("cyclical", "demand", "downturn", "defense", "commercial", "economic"),
+        (),
+    ),
+    (
+        frozenset(("customers", "customer", "concentration")),
+        ("customers", "concentration", "significant", "revenue", "accounted"),
+        (),
+    ),
+    (
+        frozenset(("dpo", "payable", "payables")),
+        ("accounts", "payable", "inventory", "purchases", "cost", "sales"),
+        (_hdr("balance", "sheets"), _hdr("statement", "operations"), _hdr("consolidated", "statements")),
+    ),
+    (
+        frozenset(("tax", "taxes", "taxpayer")),
+        ("income", "taxes", "effective", "rate", "provision"),
+        (_hdr("income", "taxes"), _hdr("statement", "income"), _hdr("statement", "operations")),
+    ),
+    (
+        frozenset(("margin", "margins")),
+        ("profit", "operating", "gross", "cost", "sales"),
+        (_hdr("statement", "operations"), _hdr("statement", "income"), _hdr("consolidated", "statements")),
+    ),
+    (
+        frozenset(("segment", "segments")),
+        ("segment", "operating", "reportable", "business"),
+        (),
+    ),
+    (
+        frozenset(("inventory", "inventories")),
+        ("inventories", "balance", "current", "assets"),
+        (_hdr("balance", "sheets"),),
+    ),
+    (
+        frozenset(("debt", "borrowings")),
+        ("debt", "borrowings", "loans", "notes", "long", "term"),
+        (_hdr("balance", "sheets"),),
+    ),
+    (
+        frozenset(("repair", "repairs", "maintenance", "aftermarket")),
+        ("products", "services", "spare", "parts", "aftermarket", "replacement"),
+        (),
+    ),
+    (
+        frozenset(("gross", "profit")),
+        ("cost", "sales", "margin", "profit"),
+        (_hdr("statement", "operations"), _hdr("statement", "income")),
+    ),
+    (
+        frozenset(("ebitda",)),
+        ("operating", "income", "depreciation", "amortization", "profit"),
+        (_hdr("statement", "income"), _hdr("statement", "operations"), _hdr("consolidated", "statements")),
+    ),
 )
 
 _TERM_CACHE_LIMIT = 4096
-_TERM_CACHE: dict[str, tuple[Counter[str], Counter[tuple[str, str]], Counter[tuple[str, str]], int]] = {}
-
-
-def _strip_plural(token: str) -> str:
-    if token.endswith("ies") and len(token) > 4:
-        return f"{token[:-3]}y"
-    if token.endswith("sses"):
-        return token[:-2]
-    if token.endswith("s") and not token.endswith(("ss", "us", "is")):
-        return token[:-1]
-    return token
-
-
-def _strip_suffixes(token: str) -> str:
-    if token.endswith("ation") and len(token) > 6:
-        token = token[:-2]
-    if token.endswith("ing") and len(token) > 5:
-        return token[:-3]
-    if token.endswith("ed") and len(token) > 4:
-        token = token[:-2]
-    if token.endswith("e") and len(token) > 4:
-        return token[:-1]
-    return token
-
-
-def _stem(token: str) -> str:
-    if len(token) <= 3 or token.isdigit():
-        return token
-    return _strip_suffixes(_strip_plural(token))
-
-
-def _content_stems(tokens: list[str]) -> list[str]:
-    return [_stem(token) for token in tokens if token not in _STOPWORDS and (len(token) > 1 or token.isdigit())]
-
-
-def _bigram_key(first: str, second: str) -> tuple[str, str]:
-    return (first, second) if first <= second else (second, first)
+_TERM_CACHE: dict[str, tuple[Counter[str], Counter[tuple[str, str]], Counter[tuple[str, str]], int, bool]] = {}
 
 
 def _document_statistics(
     text: str,
-) -> tuple[Counter[str], Counter[tuple[str, str]], Counter[tuple[str, str]], int]:
+) -> tuple[Counter[str], Counter[tuple[str, str]], Counter[tuple[str, str]], int, bool]:
     """Tokenize one entry text into BM25 term, body-bigram and header-bigram counts."""
     cached = _TERM_CACHE.get(text)
     if cached is not None:
@@ -309,10 +430,13 @@ def _document_statistics(
     bigrams: Counter[tuple[str, str]] = Counter(
         _bigram_key(first, second) for first, second in zip(stems, stems[1:])
     )
+    lead = [stem for stem in stems if stem not in _HEADER_BOILERPLATE][:_HEADER_WINDOW]
+    lead = [_strip_plural(stem) for stem in lead]
     header: Counter[tuple[str, str]] = Counter(
-        _bigram_key(first, second) for first, second in zip(stems[:_HEADER_WINDOW], stems[1:_HEADER_WINDOW])
+        _bigram_key(first, second) for first, second in zip(lead, lead[1:])
     )
-    statistics = (terms, bigrams, header, len(stems))
+    is_primary_statement = any(bigram in _PRIMARY_STATEMENT_BIGRAMS for bigram in header)
+    statistics = (terms, bigrams, header, len(stems), is_primary_statement)
     if len(_TERM_CACHE) >= _TERM_CACHE_LIMIT:
         _TERM_CACHE.clear()
     _TERM_CACHE[text] = statistics
@@ -323,6 +447,7 @@ def _document_statistics(
 class _QueryPlan:
     terms: tuple[tuple[str, float], ...]
     bigrams: tuple[tuple[str, str], ...]
+    concept_header_bigrams: tuple[tuple[str, str], ...] = ()
 
 
 def _build_query_plan(question: str) -> _QueryPlan:
@@ -330,11 +455,11 @@ def _build_query_plan(question: str) -> _QueryPlan:
     counts: Counter[str] = Counter(_content_stems(tokens))
     lowered = question.lower()
     for match in _FISCAL_YEAR_PATTERN.finditer(lowered):
-        counts[match.group(1)] += _EXPANSION_WEIGHT
+        counts[_full_year(match.group(1))] += _EXPANSION_WEIGHT
     for token in tokens:
         fiscal = _FISCAL_YEAR_TOKEN.fullmatch(token)
         if fiscal is not None:
-            counts[fiscal.group(1)] += _EXPANSION_WEIGHT
+            counts[_full_year(fiscal.group(1))] += _EXPANSION_WEIGHT
             counts["fiscal"] += _EXPANSION_WEIGHT
         additions = _TOKEN_EXPANSIONS.get(token)
         if additions:
@@ -353,6 +478,10 @@ def _build_query_plan(question: str) -> _QueryPlan:
             for addition in additions:
                 counts[_stem(addition)] += _EXPANSION_WEIGHT
     expanded_bigrams: list[tuple[str, str]] = []
+    if _MA_ACRONYM_PATTERN.search(lowered):
+        counts[_stem("acquisitions")] += _EXPANSION_WEIGHT
+        counts[_stem("divestitures")] += _EXPANSION_WEIGHT
+        counts[_stem("portfolio")] += _EXPANSION_WEIGHT
     if _AMORTIZATION_ACRONYM_PATTERN.search(lowered):
         expanded_bigrams.append(_bigram_key(_stem("depreciation"), _stem("amortization")))
     if _INCOME_ACRONYM_PATTERN.search(lowered):
@@ -361,7 +490,20 @@ def _build_query_plan(question: str) -> _QueryPlan:
         _bigram_key(first, second) for first, second in zip(stems, stems[1:])
     ]
     bigrams.extend(expanded_bigram for expanded_bigram in expanded_bigrams if expanded_bigram not in bigrams)
-    return _QueryPlan(terms=tuple(counts.items()), bigrams=tuple(dict.fromkeys(bigrams)))
+    concept_header_bigrams: list[tuple[str, str]] = []
+    stem_set = set(stems)
+    for indicators, additions, headers in _CONCEPT_GROUPS:
+        if indicators & stem_set:
+            for addition in additions:
+                counts[_stem(addition)] += _EXPANSION_WEIGHT
+            for header in headers:
+                if header not in concept_header_bigrams:
+                    concept_header_bigrams.append(header)
+    return _QueryPlan(
+        terms=tuple(counts.items()),
+        bigrams=tuple(dict.fromkeys(bigrams)),
+        concept_header_bigrams=tuple(concept_header_bigrams),
+    )
 
 
 @dataclass
@@ -377,6 +519,7 @@ class _ScoredDocument:
     bigrams: Counter[tuple[str, str]] = field(default_factory=Counter)
     header: Counter[tuple[str, str]] = field(default_factory=Counter)
     length: int = 0
+    is_primary_statement: bool = False
 
 
 async def _collect_documents(memory: Any, question: str, limit: int) -> list[_ScoredDocument]:
@@ -415,7 +558,13 @@ async def _collect_documents(memory: Any, question: str, limit: int) -> list[_Sc
     for document in documents.values():
         if not document.text.strip():
             continue
-        document.terms, document.bigrams, document.header, document.length = _document_statistics(document.text)
+        (
+            document.terms,
+            document.bigrams,
+            document.header,
+            document.length,
+            document.is_primary_statement,
+        ) = _document_statistics(document.text)
         collected.append(document)
     return collected
 
@@ -436,20 +585,41 @@ def _rank_documents(plan: _QueryPlan, documents: list[_ScoredDocument]) -> list[
         term: math.log(1.0 + (len(documents) - hits + 0.5) / (hits + 0.5))
         for term, hits in document_frequency.items()
     }
+    total_plan_terms = len({term for term, _weight in plan.terms})
+    # A question typically names its company ("...for 3M?", "Amazon's ..."). Match
+    # those tokens against the leading document-id line; year tokens alone are not
+    # distinctive because several documents share the same fiscal year.
+    identity_terms = {
+        term for term, _weight in plan.terms
+        if term and not (len(term) == 4 and term.isdigit())
+    }
     for document in documents:
         score = 0.0
+        matched_terms = 0
+        first_line = document.text.split("\n", 1)[0].lower()
+        first_tokens = set(_WORD_PATTERN.findall(first_line))
+        if identity_terms & first_tokens:
+            score += _DOCUMENT_IDENTITY_BONUS
         length_norm = _BM25_K1 * (1.0 - _BM25_B + _BM25_B * document.length / average_length)
         for term, weight in plan.terms:
             frequency = document.terms.get(term)
             if not frequency:
                 continue
+            matched_terms += 1
             score += weight * inverse_frequency[term] * frequency * (_BM25_K1 + 1.0) / (frequency + length_norm)
+        if total_plan_terms:
+            score += _COVERAGE_BONUS * matched_terms / total_plan_terms
         for bigram in plan.bigrams:
             first, second = bigram
             if document.bigrams.get(bigram):
-                score += _BIGRAM_BONUS * (inverse_frequency.get(first, 0.0) + inverse_frequency.get(second, 0.0))
+                score += _BIGRAM_BONUS * max(2.0, inverse_frequency.get(first, 0.0) + inverse_frequency.get(second, 0.0))
             if document.header.get(bigram):
                 score += _HEADER_BONUS
+        for header in plan.concept_header_bigrams:
+            if document.header.get(header):
+                score += _HEADER_CONCEPT_BONUS
+        if plan.concept_header_bigrams and document.is_primary_statement:
+            score += _STATEMENT_PAGE_BONUS
         document.score = score
     return sorted(documents, key=lambda document: (-document.score, document.key))
 
