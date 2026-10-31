@@ -995,7 +995,7 @@ class ScopedContextApplication:
                 topic_reuse=topic_reuse,
                 round_zero=round_zero,
             )
-        memory_candidates = _stabilize_memory_candidates(self._runtime, memory_candidates)
+        memory_candidates = await _stabilize_memory_candidates(self._runtime, memory_candidates)
         code = await self._code_candidates(request) if request.include_code else ()
         with self._runtime._stage(
             "context.build",
@@ -1669,54 +1669,40 @@ def _memory_identity(scope_id: str, hit: MemoryHit) -> tuple[str, str, int, str,
     return (scope_id, hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
 
 
-def _stable_memory_citation_cache(runtime: BuiltinRuntime) -> dict[tuple[str, str, str], ArtifactRef]:
-    """Return the Runtime-lifetime map of Memory hits to their first observed anchor.
-
-    Keyed by ``(scope_id, memory_artifact_id, entry_version_id)``; entry versions are
-    immutable, so the first Revision that surfaced a hit still contains that exact
-    version and keeps resolving through ``memory.get`` for the entry's lifetime.
-    """
-
-    cache: dict[tuple[str, str, str], ArtifactRef] | None = getattr(runtime, "_stable_memory_citations", None)
-    if cache is None:
-        cache = {}
-        setattr(runtime, "_stable_memory_citations", cache)
-    return cache
-
-
-def _stabilize_memory_candidates(
+async def _stabilize_memory_candidates(
     runtime: BuiltinRuntime,
     candidates: Sequence[PreparedMemoryCandidates],
 ) -> list[PreparedMemoryCandidates]:
-    """Anchor memory citations at stable Revisions and order hits by first observation.
+    """Anchor memory citations at each entry version's creation Revision.
 
     Search always anchors hits at the current Memory head, so every Revision bump
     would otherwise rewrite every prepared citation byte and defeat prefix reuse in
-    the incremental context-pack protocol. Each hit is re-anchored to the immutable
-    historical Revision where it was first observed (still an exact anchor for that
-    entry version), and hits are sorted by first observation so entries appended to
-    the Memory land at the end of the prepared context instead of shifting earlier
-    items. Selection, citation precision, and budget fitting are unchanged.
+    the incremental context-pack protocol. Entry versions are immutable and their
+    ``created_in_revision`` is persisted, so anchoring each hit at the Revision that
+    created it is the earliest valid anchor: it still resolves through ``memory.get``
+    for the entry's lifetime, and it is identical across process restarts, so no
+    in-process cache is needed. Hits are ordered by ``(created_in_revision,
+    entry_id)``, which is equally restart-stable and keeps entries appended to the
+    Memory at the end of the prepared context. Selection, citation precision, and
+    budget fitting are unchanged.
     """
 
-    if not candidates:
-        return []
-    cache = _stable_memory_citation_cache(runtime)
     stabilized: list[PreparedMemoryCandidates] = []
     for group in candidates:
         if not group.hits:
             stabilized.append(group)
             continue
+        try:
+            async with runtime._context(group.scope_id) as context:
+                versions = await context.artifacts.memory.expand(group.hits)
+        except Exception:
+            stabilized.append(group)
+            continue
         hits: list[MemoryHit] = []
-        for hit in group.hits:
-            key = (group.scope_id, hit.memory_ref.artifact_id, hit.entry_version_id)
-            stable_ref = cache.get(key)
-            if stable_ref is None:
-                stable_ref = hit.memory_ref
-                cache[key] = stable_ref
-            hits.append(hit if hit.memory_ref == stable_ref else hit.model_copy(update={"memory_ref": stable_ref}))
-        order = {cached_key: index for index, cached_key in enumerate(cache)}
-        hits.sort(key=lambda hit: order[(group.scope_id, hit.memory_ref.artifact_id, hit.entry_version_id)])
+        for hit, version in zip(group.hits, versions, strict=True):
+            anchor = hit.memory_ref.model_copy(update={"revision": version.created_in_revision})
+            hits.append(hit if hit.memory_ref == anchor else hit.model_copy(update={"memory_ref": anchor}))
+        hits.sort(key=lambda hit: (hit.memory_ref.revision, hit.entry_id))
         stabilized.append(replace(group, hits=tuple(hits)))
     return stabilized
 
